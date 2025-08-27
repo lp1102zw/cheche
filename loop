@@ -1,0 +1,156 @@
+循迹
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <gpiod.h>
+#include <time.h>
+
+#define PWMA_BCM 18
+#define AIN2_BCM 27
+#define AIN1_BCM 22
+#define PWMB_BCM 23
+#define BIN2_BCM 24
+#define BIN1_BCM 25
+
+#define IR_L_BCM 13
+#define IR_R_BCM 26
+
+#define MAX_SPEED 100
+#define MIN_SPEED 30
+#define DEFAULT_SPEED 50
+
+struct gpiod_chip *chip;
+struct gpiod_line *PWMA, *AIN2, *AIN1, *PWMB, *BIN2, *BIN1;
+struct gpiod_line *IR_L, *IR_R;
+volatile sig_atomic_t running = 1;
+int speed = DEFAULT_SPEED;
+
+// 信号处理
+void handle_stop(int sig) { running = 0; }
+
+// 初始化GPIO
+int gpio_init() {
+chip = gpiod_chip_open("/dev/gpiochip0");
+if (!chip) { perror("无法打开GPIO芯片"); return -1; }
+
+PWMA = gpiod_chip_get_line(chip, PWMA_BCM);
+AIN2 = gpiod_chip_get_line(chip, AIN2_BCM);
+AIN1 = gpiod_chip_get_line(chip, AIN1_BCM);
+PWMB = gpiod_chip_get_line(chip, PWMB_BCM);
+BIN2 = gpiod_chip_get_line(chip, BIN2_BCM);
+BIN1 = gpiod_chip_get_line(chip, BIN1_BCM);
+
+IR_L = gpiod_chip_get_line(chip, IR_L_BCM);
+IR_R = gpiod_chip_get_line(chip, IR_R_BCM);
+
+struct gpiod_line_request_config out_cfg = {
+    .consumer = "car_pwm",
+    .request_type = GPIOD_LINE_REQUEST_DIRECTION_OUTPUT,
+    .flags = 0
+};
+
+struct gpiod_line_request_config in_cfg = {
+    .consumer = "car_ir",
+    .request_type = GPIOD_LINE_REQUEST_DIRECTION_INPUT,
+    .flags = 0
+};
+
+gpiod_line_request(PWMA, &out_cfg, 0);
+gpiod_line_request(AIN2, &out_cfg, 0);
+gpiod_line_request(AIN1, &out_cfg, 0);
+gpiod_line_request(PWMB, &out_cfg, 0);
+gpiod_line_request(BIN2, &out_cfg, 0);
+gpiod_line_request(BIN1, &out_cfg, 0);
+
+gpiod_line_request(IR_L, &in_cfg, 0);
+gpiod_line_request(IR_R, &in_cfg, 0);
+
+return 0;
+}
+
+// 清理GPIO
+void cleanup() {
+gpiod_line_release(PWMA);
+gpiod_line_release(AIN2);
+gpiod_line_release(AIN1);
+gpiod_line_release(PWMB);
+gpiod_line_release(BIN2);
+gpiod_line_release(BIN1);
+gpiod_line_release(IR_L);
+gpiod_line_release(IR_R);
+gpiod_chip_close(chip);
+}
+
+// 设置小车状态
+void stop_car() {
+gpiod_line_set_value(AIN1,0);
+gpiod_line_set_value(AIN2,0);
+gpiod_line_set_value(PWMA,0);
+gpiod_line_set_value(BIN1,0);
+gpiod_line_set_value(BIN2,0);
+gpiod_line_set_value(PWMB,0);
+}
+
+// 方向控制
+void forward() {
+gpiod_line_set_value(AIN1,1); gpiod_line_set_value(AIN2,0);
+gpiod_line_set_value(BIN1,1); gpiod_line_set_value(BIN2,0);
+gpiod_line_set_value(PWMA,1); gpiod_line_set_value(PWMB,1);
+}
+
+void turn_left() {
+gpiod_line_set_value(AIN1,0); gpiod_line_set_value(AIN2,0); gpiod_line_set_value(PWMA,0);
+gpiod_line_set_value(BIN1,1); gpiod_line_set_value(BIN2,0); gpiod_line_set_value(PWMB,1);
+}
+
+void turn_right() {
+gpiod_line_set_value(AIN1,1); gpiod_line_set_value(AIN2,0); gpiod_line_set_value(PWMA,1);
+gpiod_line_set_value(BIN1,0); gpiod_line_set_value(BIN2,0); gpiod_line_set_value(PWMB,0);
+}
+
+// 多次采样滤波读取红外
+int read_IR(struct gpiod_line *line) {
+int cnt = 0;
+for(int i=0;i<5;i++){
+cnt += gpiod_line_get_value(line);
+usleep(1000);
+}
+return cnt >= 3 ? 1 : 0;
+}
+
+int main() {
+signal(SIGINT, handle_stop);
+if (gpio_init() != 0) { fprintf(stderr,"GPIO初始化失败\n"); return 1; }
+
+printf("自动循迹启动，Ctrl-C退出\n");
+
+while(running) {
+    int SL = read_IR(IR_L);
+    int SR = read_IR(IR_R);
+
+    if (SL==0 && SR==0) {          // 两侧都在黑线，直行
+        printf("GO\n");
+        forward();
+    } else if (SL==1 && SR==0) {   // 左侧白，右侧黑，右偏 → 左转
+        printf("LEFT\n");
+        turn_left();
+    } else if (SL==0 && SR==1) {   // 左侧黑，右侧白，左偏 → 右转
+        printf("RIGHT\n");
+        turn_right();
+    } else {                       // 两侧都白，微调搜索黑线
+        printf("SEARCH\n");
+        turn_left();
+        usleep(5000);  // 微调时间
+    }
+
+    usleep(20000); // 20ms循环
+}
+
+stop_car();
+cleanup();
+printf("\n程序退出\n");
+return 0;
+}
+
+
